@@ -1,0 +1,7 @@
+# Nunca versionar credenciais
+.credentials.json
+*.credentials*
+config.json
+*.log
+Thumbs.db
+desktop.ini
