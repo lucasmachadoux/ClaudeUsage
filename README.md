@@ -43,14 +43,22 @@ Dê dois cliques em **`Desinstalar.cmd`**. Ele fecha o widget e remove os atalho
 
 O widget usa o login que o Claude Code salva em `%USERPROFILE%\.claude\.credentials.json`. Toda a parte que mexe com o login está num bloco curto e comentado no topo de `ClaudeUsage.ps1`:
 
-- o arquivo é **só lido**: nunca é alterado, copiado ou renovado;
-- o token fica **só na memória** durante a consulta e não é gravado nem exibido;
-- ele é enviado **apenas** para `https://api.anthropic.com` (endereço fixo, HTTPS, sem seguir redirecionamentos);
+- os tokens ficam **só na memória**: nunca são exibidos, registrados ou copiados para outro lugar;
+- o token de acesso vai **apenas** para `https://api.anthropic.com`, e o de renovação **apenas** para `https://platform.claude.com` (endereços fixos, HTTPS, sem seguir redirecionamentos);
 - respostas de erro são descartadas; o arquivo de configuração do widget guarda só a posição e o tamanho da janela.
 
-Se o login expirar, o widget mostra *"Login expirado: abra o Claude Code"*. Basta abrir o Claude Code que ele renova o login, e o widget volta a funcionar sozinho.
+### Renovação automática do login
 
-> O endereço usado (`/api/oauth/usage`) é o mesmo que o `/usage` do Claude Code consulta, mas não é documentado publicamente e pode mudar.
+O login do Claude Code vale poucas horas. Quem o renova normalmente é o próprio Claude Code, mas só quando ele está aberto (o app de desktop do Claude não atualiza esse arquivo). Para o widget não parar, ele renova o login **do mesmo jeito que o Claude Code** e grava o login novo no mesmo arquivo:
+
+- só renova quando o login **já venceu**, para não disputar com um Claude Code aberto (que renova antes de vencer);
+- no máximo uma tentativa a cada 5 minutos;
+- antes de gravar, relê o arquivo: se o Claude Code renovou nesse meio-tempo, mantém o dele;
+- a gravação é atômica (escreve ao lado e troca de uma vez), então o arquivo nunca fica pela metade.
+
+Se a renovação for recusada, o widget mostra *"Login inválido: rode "claude" no terminal e entre de novo"*.
+
+> Os endereços usados (`/api/oauth/usage` e `/v1/oauth/token`) são os mesmos que o Claude Code usa, mas não são documentados publicamente e podem mudar.
 
 ## Arquivos
 

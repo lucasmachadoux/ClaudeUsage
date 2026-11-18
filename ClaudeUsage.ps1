@@ -11,9 +11,12 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 
 # ---------- consulta à Anthropic ----------
 # ÚNICA parte do widget que toca no login. Regras:
-#   - só LÊ o arquivo de login do Claude Code (nunca altera, copia ou renova);
-#   - o token fica só na memória durante a consulta e não é gravado nem exibido;
-#   - ele só é enviado para https://api.anthropic.com (endereço fixo, sem seguir redirecionamentos);
+#   - lê o arquivo de login do Claude Code; os tokens ficam só na memória e nunca são exibidos
+#     nem copiados para outro lugar;
+#   - o token de acesso só é enviado para https://api.anthropic.com e o refresh token só para
+#     https://platform.claude.com (endereços fixos, HTTPS, sem seguir redirecionamentos);
+#   - quando o login JÁ venceu, renova do mesmo jeito que o Claude Code e grava o login novo
+#     no mesmo arquivo (troca atômica), para o Claude Code continuar funcionando;
 #   - respostas de erro são descartadas; o widget guarda só o código do erro.
 $cs = @'
 using System;
@@ -43,18 +46,104 @@ namespace ClaudeUsage {
       return Path.Combine(dir, ".credentials.json");
     }
 
+    static string ReadFile(string path) {
+      using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+      using (var sr = new StreamReader(fs)) return sr.ReadToEnd();
+    }
+
+    static string Field(string json, string name) {
+      var m = Regex.Match(json, "\"" + name + "\"\\s*:\\s*\"([^\"]+)\"");
+      return m.Success ? m.Groups[1].Value : null;
+    }
+
+    // Devolve o token de acesso; error = "nologin" ou "expired" quando não há um válido.
     static string ReadToken(out string error) {
       error = null;
       string path = CredentialsPath();
       if (!File.Exists(path)) { error = "nologin"; return null; }
-      string json;
-      using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-      using (var sr = new StreamReader(fs)) json = sr.ReadToEnd();
-      var tok = Regex.Match(json, "\"accessToken\"\\s*:\\s*\"([^\"]+)\"");
-      if (!tok.Success) { error = "nologin"; return null; }
+      string json = ReadFile(path);
+      string tok = Field(json, "accessToken");
+      if (tok == null) { error = "nologin"; return null; }
       var exp = Regex.Match(json, "\"expiresAt\"\\s*:\\s*(\\d+)");
       if (exp.Success && long.Parse(exp.Groups[1].Value) < DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()) { error = "expired"; return null; }
-      return tok.Groups[1].Value;
+      return tok;
+    }
+
+    // ---------- renovação do login ----------
+    // Faz o mesmo que o Claude Code faz quando o login vence: troca o refresh token
+    // por um token novo em platform.claude.com e grava o resultado no mesmo arquivo,
+    // para o Claude Code continuar usando. Só roda com o login JÁ vencido (assim não
+    // disputa com um Claude Code aberto, que renova antes de vencer) e no máximo a cada 5 min.
+    const string TokenUrl = "https://platform.claude.com/v1/oauth/token";
+    const string ClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+    const string Scopes   = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+    static DateTime lastRefresh = DateTime.MinValue;
+
+    // Devolve null se deu certo; senão "expired", "relogin" ou "network".
+    static async Task<string> Refresh() {
+      if (DateTime.UtcNow - lastRefresh < TimeSpan.FromMinutes(5)) return "expired";
+      lastRefresh = DateTime.UtcNow;
+      string path = CredentialsPath();
+      string refresh = Field(ReadFile(path), "refreshToken");
+      if (refresh == null) return "relogin";
+
+      string body = "{\"grant_type\":\"refresh_token\",\"refresh_token\":\"" + refresh +
+                    "\",\"client_id\":\"" + ClientId + "\",\"scope\":\"" + Scopes + "\"}";
+      string resp;
+      try {
+        using (var req = new HttpRequestMessage(HttpMethod.Post, TokenUrl)) {
+          req.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+          req.Headers.UserAgent.ParseAdd("ClaudeUsageWidget/1.0");
+          using (var r = await http.SendAsync(req).ConfigureAwait(false)) {
+            int st = (int)r.StatusCode;
+            if (st == 400 || st == 401 || st == 403) return "relogin";
+            if (st != 200) return "expired";
+            resp = await r.Content.ReadAsStringAsync().ConfigureAwait(false);
+          }
+        }
+      } catch { return "network"; }
+      finally { body = null; }
+
+      string access = Field(resp, "access_token");
+      string newRefresh = Field(resp, "refresh_token") ?? refresh;
+      var expIn = Regex.Match(resp, "\"expires_in\"\\s*:\\s*(\\d+)");
+      var rtExpIn = Regex.Match(resp, "\"refresh_token_expires_in\"\\s*:\\s*(\\d+)");
+      resp = null;
+      if (access == null || !expIn.Success) return "expired";
+      long expiresAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + long.Parse(expIn.Groups[1].Value) * 1000;
+
+      // Relê o arquivo: se o Claude Code renovou nesse meio-tempo, mantém o dele.
+      string json = ReadFile(path);
+      if (Field(json, "refreshToken") != refresh) return null;
+      json = Regex.Replace(json, "(\"accessToken\"\\s*:\\s*\")[^\"]+(\")",  m => m.Groups[1].Value + access + m.Groups[2].Value);
+      json = Regex.Replace(json, "(\"refreshToken\"\\s*:\\s*\")[^\"]+(\")", m => m.Groups[1].Value + newRefresh + m.Groups[2].Value);
+      json = Regex.Replace(json, "(\"expiresAt\"\\s*:\\s*)\\d+",           m => m.Groups[1].Value + expiresAt);
+      if (rtExpIn.Success) {
+        long rtExpiresAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + long.Parse(rtExpIn.Groups[1].Value) * 1000;
+        json = Regex.Replace(json, "(\"refreshTokenExpiresAt\"\\s*:\\s*)\\d+", m => m.Groups[1].Value + rtExpiresAt);
+      }
+
+      // Gravação atômica: escreve ao lado e troca de uma vez (nunca deixa o arquivo pela metade).
+      string tmp = path + ".widget-tmp";
+      try {
+        File.WriteAllText(tmp, json, new System.Text.UTF8Encoding(false));
+        File.Replace(tmp, path, null);
+      } catch { try { File.Delete(tmp); } catch {} return "expired"; }
+      return null;
+    }
+
+    static async Task<int> Query(Result r, string token) {
+      using (var req = new HttpRequestMessage(HttpMethod.Get, Url)) {
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        req.Headers.Add("anthropic-beta", "oauth-2025-04-20");
+        req.Headers.Accept.ParseAdd("application/json");
+        req.Headers.UserAgent.ParseAdd("ClaudeUsageWidget/1.0");
+        using (var resp = await http.SendAsync(req).ConfigureAwait(false)) {
+          r.Status = (int)resp.StatusCode;
+          r.Body = r.Status == 200 ? await resp.Content.ReadAsStringAsync().ConfigureAwait(false) : null;
+          return r.Status;
+        }
+      }
     }
 
     public static async Task<Result> Fetch() {
@@ -62,18 +151,25 @@ namespace ClaudeUsage {
       try {
         string err;
         string token = ReadToken(out err);
-        if (token == null) { r.Error = err; return r; }
-        using (var req = new HttpRequestMessage(HttpMethod.Get, Url)) {
-          req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-          token = null;
-          req.Headers.Add("anthropic-beta", "oauth-2025-04-20");
-          req.Headers.Accept.ParseAdd("application/json");
-          req.Headers.UserAgent.ParseAdd("ClaudeUsageWidget/1.0");
-          using (var resp = await http.SendAsync(req).ConfigureAwait(false)) {
-            r.Status = (int)resp.StatusCode;
-            if (r.Status == 200) r.Body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
-          }
+        bool refreshed = false;
+        if (token == null && err == "expired") {
+          string e = await Refresh().ConfigureAwait(false);
+          if (e != null) { r.Error = e; return r; }
+          refreshed = true;
+          token = ReadToken(out err);
         }
+        if (token == null) { r.Error = err; return r; }
+        int st = await Query(r, token).ConfigureAwait(false);
+        if (st == 401 && !refreshed) {
+          // Token recusado antes da hora: tenta renovar uma vez.
+          lastRefresh = DateTime.MinValue;
+          string e = await Refresh().ConfigureAwait(false);
+          if (e != null) { r.Error = e; return r; }
+          token = ReadToken(out err);
+          if (token == null) { r.Error = err; return r; }
+          await Query(r, token).ConfigureAwait(false);
+        }
+        token = null;
       } catch { r.Error = "network"; }
       return r;
     }
@@ -313,7 +409,9 @@ function Complete-Fetch($r) {
   if ($r.Error -eq 'nologin') {
     $state.Message = 'Login do Claude Code não encontrado'; $state.NextFetch = $now.AddMinutes(3)
   } elseif ($r.Error -eq 'expired') {
-    $state.Message = 'Login expirado: abra o Claude Code'; $state.NextFetch = $now.AddMinutes(2)
+    $state.Message = 'Login expirado: tentando renovar em 5 min'; $state.NextFetch = $now.AddMinutes(5)
+  } elseif ($r.Error -eq 'relogin') {
+    $state.Message = 'Login inválido: rode "claude" no terminal e entre de novo'; $state.NextFetch = $now.AddMinutes(3)
   } elseif ($r.Error -eq 'network') {
     $state.Message = 'Sem conexão: tentando de novo em 1 min'; $state.NextFetch = $now.AddMinutes(1)
   } elseif ($r.Status -eq 200) {
