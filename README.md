@@ -11,6 +11,7 @@ Feito em PowerShell + WPF. Não precisa instalar nada.
 
 ## Recursos
 
+- Mostra no topo **qual conta** está sendo exibida (organização ou e-mail, e o plano). Passe o mouse para ver os detalhes
 - Barras coloridas: laranja (normal), amarelo (≥ 60%), vermelho (≥ 85%)
 - Contagem regressiva até cada reset
 - Atualiza sozinho a cada 3 minutos, com botão para atualizar na hora
@@ -38,6 +39,17 @@ Feito em PowerShell + WPF. Não precisa instalar nada.
 ### Desinstalar
 
 Dê dois cliques em **`Desinstalar.cmd`**. Ele fecha o widget e remove os atalhos (área de trabalho e inicialização) e as preferências da janela. Depois é só apagar a pasta. O seu login do Claude Code não é tocado.
+
+## Várias contas
+
+O widget mostra a conta que está logada no **Claude Code do terminal**. Para trocar:
+
+1. Rode `claude` no terminal.
+2. Use `/login` e entre com a outra conta.
+
+O widget percebe a troca sozinho em poucos segundos: descarta os números da conta anterior e mostra os da nova.
+
+> O app de desktop do Claude guarda o login dele de forma criptografada, então o widget não consegue seguir a conta aberta lá. Ele segue sempre a do terminal.
 
 ## Segurança do seu login
 

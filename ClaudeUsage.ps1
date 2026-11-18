@@ -28,7 +28,7 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
 namespace ClaudeUsage {
-  public class Result { public int Status; public string Body; public string Error; }
+  public class Result { public int Status; public string Body; public string Error; public string Plan; }
 
   public static class Api {
     const string Url = "https://api.anthropic.com/api/oauth/usage";
@@ -64,6 +64,7 @@ namespace ClaudeUsage {
       string json = ReadFile(path);
       string tok = Field(json, "accessToken");
       if (tok == null) { error = "nologin"; return null; }
+      Plan = Field(json, "subscriptionType");   // "pro", "max"... (não é segredo)
       var exp = Regex.Match(json, "\"expiresAt\"\\s*:\\s*(\\d+)");
       if (exp.Success && long.Parse(exp.Groups[1].Value) < DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()) { error = "expired"; return null; }
       return tok;
@@ -78,6 +79,7 @@ namespace ClaudeUsage {
     const string ClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
     const string Scopes   = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
     static DateTime lastRefresh = DateTime.MinValue;
+    static string Plan;
 
     // Devolve null se deu certo; senão "expired", "relogin" ou "network".
     static async Task<string> Refresh() {
@@ -171,6 +173,7 @@ namespace ClaudeUsage {
         }
         token = null;
       } catch { r.Error = "network"; }
+      r.Plan = Plan;
       return r;
     }
   }
@@ -273,7 +276,7 @@ $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'ClaudeUsage.l
           <TextBlock x:Name="RefreshIcon" Text="&#xE72C;" FontFamily="{StaticResource Icons}" FontSize="11"/>
         </Button>
         <Ellipse Width="8" Height="8" Fill="#D97757" VerticalAlignment="Center" Margin="0,0,8,0"/>
-        <TextBlock Text="Uso do Claude" Foreground="#9AA0A6" FontSize="12" VerticalAlignment="Center"/>
+        <TextBlock x:Name="Account" Text="Uso do Claude" Foreground="#9AA0A6" FontSize="12" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Background="Transparent"/>
       </DockPanel>
 
       <!-- Limite de 5 horas -->
@@ -310,7 +313,7 @@ $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'ClaudeUsage.l
 
 $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
 $ui = @{}
-foreach ($n in 'Card','Root','BtnClose','BtnMin','BtnRefresh','RefreshIcon','SPct','SCol0','SCol1','SFill','SReset','WPct','WCol0','WCol1','WFill','WReset','Footer') {
+foreach ($n in 'Card','Root','Account','BtnClose','BtnMin','BtnRefresh','RefreshIcon','SPct','SCol0','SCol1','SFill','SReset','WPct','WCol0','WCol1','WFill','WReset','Footer') {
   $ui[$n] = $window.FindName($n)
 }
 
@@ -331,6 +334,50 @@ if ($null -ne $state.Left -and $null -ne $state.Top) {
   $wa = [System.Windows.SystemParameters]::WorkArea
   $window.Left = $wa.Right - 300
   $window.Top  = $wa.Top + 20
+}
+
+# ---------- conta ----------
+# O widget mostra a conta logada no Claude Code do terminal. Os dados vêm de ~/.claude.json
+# (nome da organização, e-mail), que não contém segredos. Trocar de conta: "claude" → /login.
+$claudeDir  = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $env:USERPROFILE '.claude' }
+$claudeJson = if ($env:CLAUDE_CONFIG_DIR) { Join-Path $env:CLAUDE_CONFIG_DIR '.claude.json' } else { Join-Path $env:USERPROFILE '.claude.json' }
+$credFile   = Join-Path $claudeDir '.credentials.json'   # usado só para ver a data de alteração
+$state.Account = $null; $state.Plan = $null; $state.CredTime = $null; $state.CfgTime = $null
+
+function Get-Account {
+  try {
+    $o = (Get-Content $claudeJson -Raw -Encoding UTF8 | ConvertFrom-Json).oauthAccount
+    if (-not $o) { return $null }
+    [pscustomobject]@{ Email = [string]$o.emailAddress; Org = [string]$o.organizationName; Name = [string]$o.displayName }
+  } catch { return $null }
+}
+
+function Get-MTime($p) { try { (Get-Item $p -ErrorAction Stop).LastWriteTimeUtc } catch { $null } }
+
+# Confere se a conta mudou (só quando os arquivos do Claude Code mudam de data).
+function Update-Account {
+  $c1 = Get-MTime $credFile; $c2 = Get-MTime $claudeJson
+  if ($c1 -eq $state.CredTime -and $c2 -eq $state.CfgTime) { return }
+  $state.CredTime = $c1; $state.CfgTime = $c2
+  $acc = Get-Account
+  $old = $state.Account
+  $state.Account = $acc
+  if ($old -and $acc -and $old.Email -ne $acc.Email) {
+    # Trocou de conta: descarta os números da conta anterior e consulta já.
+    $state.Data = $null; $state.LastOk = $null; $state.Plan = $null
+    $state.Message = 'trocando de conta…'; $state.MessageBad = $false
+    if (-not $state.Task) { $state.NextFetch = [DateTime]::MinValue }
+  }
+  Render
+}
+
+function Get-AccountLabel {
+  $a = $state.Account
+  if (-not $a) { return 'Uso do Claude' }
+  # Conta pessoal tem organização "fulano@...'s Organization": aí mostra o e-mail.
+  $label = if ($a.Org -and $a.Org -notmatch "'s Organization$") { $a.Org } elseif ($a.Email) { $a.Email } else { 'Claude' }
+  if ($state.Plan) { $label += ' · ' + (Get-Culture).TextInfo.ToTitleCase($state.Plan) }
+  $label
 }
 
 # ---------- exibição ----------
@@ -377,6 +424,11 @@ function Show-Limit($d, $pctTb, $col0, $col1, $fill, $resetTb, [bool]$weekly) {
 
 function Render {
   $state.LastRender = Get-Date
+  $ui.Account.Text = Get-AccountLabel
+  $a = $state.Account
+  $ui.Account.ToolTip = if ($a) {
+    "Conta: $($a.Email)`nOrganização: $($a.Org)`n`nPara trocar de conta: rode ""claude"" no terminal e use /login"
+  } else { 'Nenhuma conta do Claude Code encontrada' }
   $d = $state.Data
   Show-Limit $(if ($d) { $d.five_hour } else { $null }) $ui.SPct $ui.SCol0 $ui.SCol1 $ui.SFill $ui.SReset $false
   Show-Limit $(if ($d) { $d.seven_day } else { $null }) $ui.WPct $ui.WCol0 $ui.WCol1 $ui.WFill $ui.WReset $true
@@ -398,6 +450,7 @@ function Render {
 function Start-Fetch {
   if ($state.Task) { return }
   $state.LastFetch = Get-Date
+  $state.FetchEmail = if ($state.Account) { $state.Account.Email } else { $null }
   $ui.RefreshIcon.Opacity = 0.35
   $state.Task = [ClaudeUsage.Api]::Fetch()
 }
@@ -405,6 +458,13 @@ function Start-Fetch {
 function Complete-Fetch($r) {
   $ui.RefreshIcon.Opacity = 1
   $now = Get-Date
+  $curEmail = if ($state.Account) { $state.Account.Email } else { $null }
+  if ($state.FetchEmail -ne $curEmail) {
+    # A conta mudou durante a consulta: descarta a resposta e consulta de novo.
+    $state.NextFetch = [DateTime]::MinValue
+    return
+  }
+  if ($r.Plan) { $state.Plan = [string]$r.Plan }
   $state.MessageBad = $true
   if ($r.Error -eq 'nologin') {
     $state.Message = 'Login do Claude Code não encontrado'; $state.NextFetch = $now.AddMinutes(3)
@@ -432,6 +492,7 @@ function Complete-Fetch($r) {
 
 $tick = {
   try {
+    Update-Account
     if ($state.Task) {
       if ($state.Task.IsCompleted) {
         $t = $state.Task; $state.Task = $null
